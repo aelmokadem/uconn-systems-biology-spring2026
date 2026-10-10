@@ -1,0 +1,548 @@
+---
+title: "Pharmacodynamics and Exposure-Response Modelling"
+subtitle: "Population PK and PKPD | Worked examples in R"
+lang: en
+format:
+  html:
+    output-file: pd-er-lecture-notes.html
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-summary: "Show code"
+    code-tools: true
+    embed-resources: true
+  pdf:
+    output-file: pd-er-lecture.pdf
+    pdf-engine: lualatex
+    toc: true
+    geometry: margin=1in
+    fontsize: 11pt
+    mainfont: Arial
+    sansfont: Arial
+    monofont: Menlo
+    execute:
+      fig-format: png
+      fig-dpi: 200
+  revealjs:
+    output-file: pd-er-lecture-slides.html
+    theme: simple
+    slide-level: 2
+    slide-number: c/t
+    scrollable: true
+    auto-stretch: false
+    css: pkpd-lecture-v3-slides.css
+    width: 1280
+    height: 800
+    center: false
+    transition: none
+    code-fold: true
+    code-summary: "Show code"
+    code-copy: true
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+  error: false
+  fig-width: 10
+  fig-height: 5
+  fig-dpi: 144
+---
+
+## Learning Objectives
+
+By the end of this session, you should be able to:
+
+1. Distinguish dose-response from concentration-response and exposure-response.
+2. Interpret baseline, maximum effect, potency, and Hill slope.
+3. Fit a simple nonlinear response model and a population model with `nlme`.
+4. Explain why concentration and effect can peak at different times.
+5. Distinguish sequential, intermediate, and joint PK/PD approaches.
+6. Identify what a response dataset can and cannot establish.
+
+## Session Plan
+
+| Topic | Approximate time |
+|---|---:|
+| Receptor theory and Emax models | 20 minutes |
+| Real data: PBG dose-response | 25 minutes |
+| Synthetic population concentration-response | 25 minutes |
+| Direct, effect-compartment, and indirect response | 25 minutes |
+| PK/PD estimation strategies and interpretation | 15 minutes |
+| Discussion and exercises | 10 minutes |
+
+## R Setup
+
+```{r}
+#| label: pd-setup
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(nlme)
+library(deSolve)
+theme_set(theme_minimal(base_size = 14))
+
+emax <- function(C, Emax, EC50, E0 = 0, hill = 1) {
+  E0 + Emax * C^hill / (EC50^hill + C^hill)
+}
+```
+
+This lecture adapts the Emax and PK/PD simulation examples from `pkpd-lecture-v3.qmd`.
+Packages are loaded once; no installation or network access is required during execution.
+
+## From Dose to Response
+
+![The PK/PD chain](images/pkpd-diagram.png)
+
+**Dose -> concentration over time -> pharmacological response.**
+
+PK describes drug disposition. PD describes the relationship between drug concentration and response, including delays and biological turnover.
+
+## Dose, Concentration, and Exposure
+
+| Predictor | Example | Half-maximal parameter |
+|---|---|---|
+| Administered dose | Micrograms injected | ED50 |
+| Concentration | Plasma concentration in mg/L | EC50 or IC50 |
+| Summary exposure | AUC, peak, or trough concentration | Depends on the chosen metric |
+
+A dose-response curve includes the consequences of both PK and PD. Two individuals can receive the same dose but have different concentrations and responses.
+
+An AUC-response association is not automatically a mechanistic concentration-effect model. The exposure metric must match the biological question and endpoint timing.
+
+## Receptor Occupancy: A Starting Point
+
+For a simple equilibrium binding model:
+
+$$f_{\mathrm{occupied}} = \frac{C_{\mathrm{free}}}{K_D + C_{\mathrm{free}}}.$$
+
+At $C_{\mathrm{free}}=K_D$, half of the receptors are occupied.
+
+If response is proportional to occupancy, this motivates a hyperbolic Emax relationship. Receptor reserve, signal amplification, active metabolites, and downstream regulation can break that proportionality: **EC50 need not equal $K_D$**.
+
+## The Emax Model
+
+$$E(C)=E_0+\frac{E_{\max}C^h}{EC_{50}^h+C^h}.$$
+
+| Parameter | Interpretation |
+|---|---|
+| $E_0$ | Response without drug |
+| $E_{\max}$ | Maximum change from baseline, in response units |
+| $EC_{50}$ | Concentration giving half of that maximum change |
+| $h$ | Empirical steepness parameter (Hill coefficient) |
+
+The upper asymptote is $E_0+E_{\max}$. Emax need not be 100%, and a Hill coefficient above one does not by itself establish molecular cooperativity.
+
+## Simulation: Potency
+
+```{r}
+#| label: pd-potency
+potency <- expand.grid(C = seq(0, 30, 0.1), EC50 = c(2, 5, 10)) %>%
+  mutate(effect = emax(C, 100, EC50),
+         curve = paste("EC50 =", EC50, "mg/L"))
+ggplot(potency, aes(C, effect, color = curve)) +
+  geom_line(linewidth = 1) +
+  labs(x = "Concentration (mg/L)", y = "Change in response (units)", color = NULL)
+```
+
+Lower EC50 means greater potency for this endpoint. All three curves share the same Emax.
+
+## Simulation: Hill Slope
+
+```{r}
+#| label: pd-hill
+hill_curves <- expand.grid(C = seq(0, 20, 0.05), hill = c(1, 2, 4)) %>%
+  mutate(effect = emax(C, 100, 5, hill = hill),
+         curve = paste("Hill slope =", hill))
+ggplot(hill_curves, aes(C, effect, color = curve)) +
+  geom_line(linewidth = 1) + geom_vline(xintercept = 5, linetype = "dotted") +
+  labs(x = "Concentration (mg/L)", y = "Change in response (units)", color = NULL)
+```
+
+All curves pass through half-maximal effect at EC50. Higher Hill slopes concentrate the transition into a narrower concentration range.
+
+## Inhibitory Responses
+
+For a response suppressed by drug:
+
+$$R(C)=R_0\left(1-\frac{I_{\max}C}{IC_{50}+C}\right),\qquad 0\le I_{\max}\le1.$$
+
+IC50 gives half of the maximum inhibition, not necessarily a 50% reduction from baseline. If $I_{\max}=0.8$, the response at IC50 is $0.6R_0$.
+
+## Real Data: Phenylbiguanide in Rabbits
+
+`nlme::PBG` contains 60 observations from five rabbits. Each rabbit received ascending phenylbiguanide doses under placebo and MDL 72222 treatment.
+
+```{r}
+#| label: pbg-data
+pbg <- as.data.frame(PBG)
+pbg$Treatment <- relevel(pbg$Treatment, ref = "Placebo")
+head(pbg)
+```
+
+The response is change in blood pressure; the predictor is injected dose. **These are dose-response data, with no measured concentrations or response time course.**
+
+Source: [nlme PBG documentation](https://stat.ethz.ch/CRAN/web/packages/nlme/refman/nlme.html#PBG) and [MASS Rabbit documentation](https://stat.ethz.ch/R-manual/R-devel/library/MASS/html/Rabbit.html).
+
+## PBG: Observed Dose-Response
+
+```{r}
+#| label: pbg-observed
+ggplot(pbg, aes(dose, deltaBP, color = Treatment)) +
+  geom_point(size = 2) + geom_line(aes(group = Treatment)) +
+  scale_x_log10() + facet_wrap(~ Rabbit, nrow = 2) +
+  labs(x = "Phenylbiguanide dose (micrograms; log scale)",
+       y = "Recorded blood-pressure change", color = NULL)
+```
+
+Compare treatments within each rabbit. Does treatment change the apparent potency, the plateau, or both? Does either curve clearly reach a plateau?
+
+## PBG: A Parsimonious Population Model
+
+$$\Delta BP_{ij}=\frac{E_{\max,T}D_{ij}^2}{ED_{50,i,T}^2+D_{ij}^2}+\epsilon_{ij},$$
+$$\log ED_{50,i,T}=\theta_{ED50,T}+\eta_i.$$
+
+Treatment has fixed effects on log Emax and log ED50. A shared rabbit-level random effect on log ED50 respects the paired design.
+
+For this introductory example, baseline is fixed at zero and Hill slope at two. These are modelling assumptions, not established biological facts. Five animals provide limited support for elaborate random-effects structures.
+
+## PBG: Fit with nlme
+
+```{r}
+#| label: pbg-fit
+pbg_fit <- nlme(
+  deltaBP ~ exp(logEmax) * dose^2 / (exp(logED50)^2 + dose^2),
+  data = pbg,
+  fixed = logEmax + logED50 ~ Treatment,
+  random = logED50 ~ 1 | Rabbit,
+  start = c(log(35), log(0.5), log(40), log(2))
+)
+fixef(pbg_fit)
+VarCorr(pbg_fit)
+```
+
+Log parameterization keeps Emax and ED50 positive. Starting values are intercepts and treatment contrasts on the log scale, in the order of the fixed-effects formulas.
+
+## PBG: Population and Individual Predictions
+
+```{r}
+#| label: pbg-predictions
+pbg_grid <- expand.grid(
+  dose = exp(seq(log(min(pbg$dose)), log(max(pbg$dose)), length.out = 100)),
+  Rabbit = levels(pbg$Rabbit), Treatment = levels(pbg$Treatment)
+)
+pbg_grid$population <- predict(pbg_fit, pbg_grid, level = 0)
+pbg_grid$individual <- predict(pbg_fit, pbg_grid, level = 1)
+ggplot(pbg, aes(dose, deltaBP, color = Treatment)) +
+  geom_point(size = 2) +
+  geom_line(data = pbg_grid, aes(y = individual), linewidth = 0.9) +
+  geom_line(data = pbg_grid, aes(y = population), linetype = "dashed") +
+  scale_x_log10() + facet_wrap(~ Rabbit, nrow = 2) +
+  labs(x = "Dose (micrograms; log scale)", y = "Recorded blood-pressure change",
+       color = NULL)
+```
+
+Solid curves include estimated rabbit effects. Dashed curves set random effects to zero; they are typical-subject predictions, not necessarily the arithmetic population mean.
+
+## PBG: Interpreting the Treatment Contrast
+
+```{r}
+#| label: pbg-parameters
+b <- fixef(pbg_fit)
+data.frame(
+  Treatment = c("Placebo", "MDL 72222"),
+  Emax = exp(c(b[1], b[1] + b[2])),
+  ED50_micrograms = exp(c(b[3], b[3] + b[4]))
+)
+```
+
+Under this model, treatment shifts the estimated dose-response relationship. When a plateau is poorly observed, Emax and ED50 can compensate for each other. Do not treat the fitted Emax contrast as proof of a change in receptor efficacy or infer a specific antagonism mechanism from these curves alone.
+
+## PBG: Residual Checks
+
+```{r}
+#| label: pbg-diagnostics
+pbg$residual <- residuals(pbg_fit, type = "pearson")
+pbg$fitted <- fitted(pbg_fit)
+ggplot(pbg, aes(fitted, residual, color = Treatment)) +
+  geom_hline(yintercept = 0, linetype = "dotted") + geom_point(size = 2) +
+  labs(x = "Individual fitted response", y = "Pearson residual", color = NULL)
+```
+
+Check for systematic patterns, unequal variability, and unusual rabbits. The model assumes conditionally independent additive errors; repeated ascending doses may require additional checks for order or carryover effects.
+
+## Synthetic Data: Known Concentration-Response
+
+To study EC50, we need concentrations. Generate an explicitly synthetic endpoint for 30 subjects at concentrations spanning below and above EC50.
+
+```{r}
+#| label: synthetic-population
+set.seed(42)
+subjects <- data.frame(Subject = factor(seq_len(30)),
+                       EC50 = 5 * exp(rnorm(30, sd = 0.3)))
+pd_data <- expand.grid(Subject = subjects$Subject,
+                      conc = c(0, 0.25, 0.5, 1, 2, 5, 10, 20, 40)) %>%
+  left_join(subjects, by = "Subject") %>%
+  mutate(effect = emax(conc, 100, EC50) + rnorm(n(), sd = 4))
+head(pd_data)
+```
+
+True population Emax is 100 units, typical EC50 is 5 mg/L, and log EC50 random-effect SD is 0.3. Noise is additive with SD 4 units. Responses are continuous change scores; negative noisy values are retained rather than clipped.
+
+## First Fit: Ignore the Grouping
+
+```{r}
+#| label: synthetic-pooled
+pooled_fit <- nls(
+  effect ~ exp(logEmax) * conc / (exp(logEC50) + conc),
+  data = pd_data, start = list(logEmax = log(80), logEC50 = log(8))
+)
+exp(coef(pooled_fit))
+```
+
+This reuses the single-curve Emax fitting approach from the PK/PD lecture. It treats all observations as independent and gives no explicit estimate of between-subject variation.
+
+## Population Emax Fit with nlme
+
+```{r}
+#| label: synthetic-nlme
+pd_fit <- nlme(
+  effect ~ exp(logEmax) * conc / (exp(logEC50) + conc),
+  data = pd_data,
+  fixed = logEmax + logEC50 ~ 1,
+  random = logEC50 ~ 1 | Subject,
+  start = coef(pooled_fit)
+)
+data.frame(Parameter = c("Emax", "Typical EC50"),
+           True = c(100, 5), Estimated = exp(fixef(pd_fit)))
+VarCorr(pd_fit)
+```
+
+Compare estimated variability with the generating SD of 0.3. Individual EC50 estimates borrow information across subjects; they are not independent per-subject fits.
+
+## Population and Individual Concentration-Response
+
+```{r}
+#| label: synthetic-curves
+pd_grid <- expand.grid(Subject = levels(pd_data$Subject)[1:6],
+                       conc = seq(0, 40, length.out = 150))
+pd_grid$individual <- predict(pd_fit, pd_grid, level = 1)
+pd_grid$population <- predict(pd_fit, pd_grid, level = 0)
+ggplot(filter(pd_data, Subject %in% pd_grid$Subject), aes(conc, effect)) +
+  geom_point(color = "steelblue", size = 2) +
+  geom_line(data = pd_grid, aes(y = individual), color = "firebrick") +
+  geom_line(data = pd_grid, aes(y = population), linetype = "dashed") +
+  facet_wrap(~ Subject, nrow = 2) +
+  labs(x = "Concentration (mg/L)", y = "Synthetic change in response (units)")
+```
+
+Solid curves include subject effects; dashed curves represent a typical subject. These data are simulated, not measured PD outcomes from theophylline patients.
+
+## Identifiability Depends on the Concentration Range
+
+If every concentration is far below EC50:
+
+$$E(C)-E_0\approx\frac{E_{\max}}{EC_{50}}C.$$
+
+The data mainly identify the ratio Emax/EC50. Many pairs of parameters can produce similar curves.
+
+Sample baseline, the transition region, and the plateau when feasible. A good-looking fit within the observed range may still extrapolate poorly. More subjects do not necessarily compensate for an uninformative concentration range.
+
+## A Short PK Refresher
+
+Reuse the one-compartment oral model with first-order absorption:
+
+$$C(t)=\frac{FDk_a}{V(k_a-k_e)}\left(e^{-k_et}-e^{-k_at}\right),\qquad k_e=CL/V.$$
+
+```{r}
+#| label: oral-pk-function
+pk_oral <- function(time, dose, ka = 1.2, CL = 4, V = 20) {
+  ke <- CL / V
+  dose * ka / (V * (ka - ke)) * (exp(-ke * time) - exp(-ka * time))
+}
+```
+
+In the simulations below, dose is in mg, V in L, CL in L/h, and bioavailability is fixed at one. Parameters are illustrative, not patient estimates.
+
+## Direct Response: Concentration and Effect over Time
+
+```{r}
+#| label: direct-time-course
+direct <- data.frame(time = seq(0, 48, by = 0.1)) %>%
+  mutate(concentration = pk_oral(time, dose = 100),
+         response = emax(concentration, 100, 2))
+direct %>% pivot_longer(c(concentration, response), names_to = "Endpoint") %>%
+  ggplot(aes(time, value)) + geom_line(color = "steelblue", linewidth = 1) +
+  facet_wrap(~ Endpoint, ncol = 1, scales = "free_y") +
+  labs(x = "Time (h)", y = "Concentration (mg/L) or response (units)")
+```
+
+A direct Emax relationship changes the shape and scale, but introduces no temporal delay: the same concentration produces the same response on the rising and falling limbs.
+
+## Effect Compartment: A Distributional Delay
+
+$$\frac{dC_e}{dt}=k_{e0}(C_p-C_e),\qquad E(t)=\frac{E_{\max}C_e}{EC_{50}+C_e}.$$
+
+The hypothetical effect compartment links plasma concentration to an effect-site concentration. It does not remove a material amount of drug from the PK system.
+
+The equilibration half-life is $\log(2)/k_{e0}$. Slow equilibration can delay the effect peak and produce hysteresis when effect is plotted against plasma concentration.
+
+## Simulating an Effect Compartment
+
+```{r}
+#| label: effect-compartment
+effect_rhs <- function(time, state, pars) {
+  cp <- pk_oral(time, dose = pars[["dose"]])
+  list(c(Ce = pars[["ke0"]] * (cp - state[["Ce"]])))
+}
+delayed <- as.data.frame(ode(
+  y = c(Ce = 0), times = direct$time, func = effect_rhs,
+  parms = c(dose = 100, ke0 = 0.25)
+)) %>% mutate(concentration = pk_oral(time, 100),
+              response = emax(Ce, 100, 2))
+bind_rows(transmute(direct, time, response, Model = "Direct"),
+          transmute(delayed, time, response, Model = "Effect compartment")) %>%
+  ggplot(aes(time, response, color = Model)) + geom_line(linewidth = 1) +
+  labs(x = "Time (h)", y = "Synthetic response (units)")
+```
+
+## Hysteresis: The Same Plasma Concentration, Different Effects
+
+```{r}
+#| label: hysteresis
+bind_rows(transmute(direct, time, concentration, response, Model = "Direct"),
+          transmute(delayed, time, concentration, response,
+                    Model = "Effect compartment")) %>%
+  ggplot(aes(concentration, response, color = Model)) +
+  geom_path(linewidth = 1, arrow = grid::arrow(length = grid::unit(0.15, "cm"))) +
+  labs(x = "Plasma concentration (mg/L)", y = "Synthetic response (units)")
+```
+
+Paths follow time order. A loop flags a failure of the instantaneous plasma concentration-response assumption; it does not uniquely identify the mechanism of delay.
+
+## Indirect Response: Biological Turnover
+
+At baseline, response production and loss balance:
+
+$$\frac{dR}{dt}=k_{in}-k_{out}R,\qquad R_0=\frac{k_{in}}{k_{out}}.$$
+
+For drug inhibition of production:
+
+$$\frac{dR}{dt}=k_{in}\left(1-\frac{I_{\max}C_p}{IC_{50}+C_p}\right)-k_{out}R.$$
+
+Drug changes a process controlling the biomarker. Response falls and recovers according to turnover, even if the concentration-effect interaction itself is instantaneous.
+
+## Four Basic Indirect-Response Mechanisms
+
+| Drug action | Modified equation |
+|---|---|
+| Inhibit production | $k_{in}(1-I(C))-k_{out}R$ |
+| Stimulate production | $k_{in}(1+S(C))-k_{out}R$ |
+| Inhibit loss | $k_{in}-k_{out}(1-I(C))R$ |
+| Stimulate loss | $k_{in}-k_{out}(1+S(C))R$ |
+
+Here $I(C)=I_{\max}C/(IC_{50}+C)$ and $S(C)=S_{\max}C/(SC_{50}+C)$. Choose the mechanism using endpoint biology and the observed time course, not merely the best fit.
+
+## Simulating Turnover and Recovery
+
+```{r}
+#| label: indirect-response
+turnover_rhs <- function(time, state, pars) {
+  cp <- pk_oral(time, pars[["dose"]])
+  inhibition <- pars[["Imax"]] * cp / (pars[["IC50"]] + cp)
+  list(c(R = pars[["kin"]] * (1 - inhibition) - pars[["kout"]] * state[["R"]]))
+}
+turnover <- as.data.frame(ode(
+  y = c(R = 100), times = direct$time, func = turnover_rhs,
+  parms = c(dose = 100, kin = 10, kout = 0.1, Imax = 0.8, IC50 = 2)
+)) %>% mutate(direct_response = 100 * (1 - 0.8 *
+                                        pk_oral(time, 100) / (2 + pk_oral(time, 100))))
+turnover %>% pivot_longer(c(R, direct_response), names_to = "Model") %>%
+  ggplot(aes(time, value, color = Model)) + geom_line(linewidth = 1) +
+  scale_color_discrete(labels = c("Direct inhibition", "Turnover inhibition")) +
+  labs(x = "Time (h)", y = "Synthetic biomarker response (units)", color = NULL)
+```
+
+Baseline is 100 because kin/kout = 10/0.1. The turnover model delays the response nadir and recovery.
+
+## Dosing Interval: Similar Exposure, Different Response Profiles
+
+Reuse superposition from the PK lecture to simulate repeated oral doses. Compare 100 mg every 24 h with 50 mg every 12 h: both supply 100 mg per day.
+
+```{r}
+#| label: repeated-dose-response
+repeated_cp <- function(time, dose, interval) {
+  dose_times <- seq(0, max(time), by = interval)
+  vapply(time, function(t) {
+    sum(pk_oral(t - dose_times[dose_times <= t], dose))
+  }, numeric(1))
+}
+regimens <- expand.grid(time = seq(0, 120, 0.1),
+                        Regimen = c("100 mg every 24 h", "50 mg every 12 h")) %>%
+  group_by(Regimen) %>%
+  mutate(concentration = repeated_cp(time,
+             if (first(Regimen) == "100 mg every 24 h") 100 else 50,
+             if (first(Regimen) == "100 mg every 24 h") 24 else 12),
+         response = emax(concentration, 100, 2)) %>% ungroup()
+regimens %>% pivot_longer(c(concentration, response), names_to = "Endpoint") %>%
+  ggplot(aes(time, value, color = Regimen)) + geom_line(linewidth = 0.8) +
+  facet_wrap(~ Endpoint, ncol = 1, scales = "free_y") +
+  labs(x = "Time (h)", y = "Concentration (mg/L) or response (units)", color = NULL)
+```
+
+Under linear PK, equal daily dose gives equal steady-state AUC per day. Peak, trough, and nonlinear response profiles can still differ. These are illustrative simulations, not dosing recommendations.
+
+## Sequential, Intermediate, and Joint PK/PD
+
+| Approach | What is estimated | Main tradeoff |
+|---|---|---|
+| Sequential | Fit PK, then condition PD on fixed PK estimates or predictions | Simpler; naive plug-in fitting does not propagate PK uncertainty |
+| Intermediate | Fix selected population PK components while estimating other quantities with PD | Compromise; specify exactly what is fixed and estimated |
+| Joint | Estimate PK and PD together using both endpoints | Shares information; greater computational and identifiability demands |
+
+Terminology for intermediate approaches varies. Distinguish fixing population PK parameters, fixing individual PK estimates, and using observed concentrations directly.
+
+## What We Have Actually Estimated
+
+The PBG fit estimates a **dose-response population model**.
+
+The synthetic Emax fit estimates a **concentration-response population model**, assuming the predictor concentrations are known without error.
+
+The ODE examples **simulate** linked PK/PD systems. They do not fit a joint model. Using `nlme` for nonlinear response curves is not equivalent to a general-purpose joint PK/PD estimation workflow.
+
+## Exposure-Response Interpretation
+
+- Check whether the chosen exposure metric captures the relevant timing.
+- Distinguish prediction within the observed range from extrapolation.
+- Consider baseline disease, adherence, dose modifications, and other confounders.
+- Separate uncertainty in typical parameters, between-subject variation, and residual noise.
+- Assess benefit and adverse effects together when discussing dose selection.
+
+An exposure-response association alone does not establish causality or a clinical dose.
+
+## Exercises
+
+1. Change Emax while keeping EC50 fixed. How do potency and maximum response differ?
+2. Refit PBG with Hill slope fixed at one. Compare residuals, fitted curves, and AIC; explain what changes.
+3. Restrict synthetic data to concentrations below 2 mg/L. What happens to Emax and EC50 estimates?
+4. Halve ke0. Predict the change in delay before running the effect-compartment simulation.
+5. Halve kout and kin together. Explain why baseline stays constant but turnover slows.
+6. Explain why neither PBG nor a good Emax curve alone establishes a clinical dosing regimen.
+
+## Take-Home Points
+
+Dose-response, concentration-response, and summary exposure-response answer related but different questions.
+
+Emax separates maximum response from potency; parameter interpretation depends on endpoint and model assumptions.
+
+Population models distinguish systematic treatment effects from individual variation. Real data and known-truth simulations are complementary teaching tools.
+
+Delayed response requires a time-course model. Effect-site equilibration and biological turnover can both cause delay but represent different mechanisms.
+
+## References and Further Reading
+
+- Pinheiro JC, Bates DM. *Mixed-Effects Models in S and S-PLUS*. Springer, 2000. [nlme documentation](https://stat.ethz.ch/CRAN/web/packages/nlme/refman/nlme.html).
+- Ludbrook J. Repeated measurements and multiple comparisons in cardiovascular research. *Cardiovascular Research*. 1994;28:303-311. PBG data provenance: [MASS Rabbit](https://stat.ethz.ch/R-manual/R-devel/library/MASS/html/Rabbit.html).
+- [nlme nonlinear model reference](https://stat.ethz.ch/R-manual/R-patched/library/nlme/html/nlme.html).
+- [Exposure-response and turnover simulation examples](https://nlmixr2.github.io/rxode2/articles/rxode2-exposure-response.html). Further reading only; this lecture uses `deSolve`, not `nlmixr2` or `rxode2`.
+- Local source material: `pkpd-lecture-v3.qmd`, Emax fitting, direct PK/PD relationships, oral PK, repeated dosing, and numerical ODE workflows.
